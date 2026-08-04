@@ -37,8 +37,13 @@ for f in "$LIBSRC" "$HDRSRC"; do
     [ -f "$f" ] || { echo "missing build output: $f" >&2; exit 1; }
 done
 
-rm -rf "$OUT"; mkdir -p "$OUT"
 STAGE="$OUT/stage"
+
+# Clear only what this script owns. build-windows.sh writes to $OUT/windows,
+# and a blanket rm -rf "$OUT" here silently deleted it.
+mkdir -p "$OUT"
+rm -rf "$STAGE"
+rm -f "$OUT"/*.deb
 
 say "staging"
 L="$STAGE/libsddc$SOVER"
