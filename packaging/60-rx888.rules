@@ -1,0 +1,15 @@
+# udev rules for the RX888 / SDDC family (Cypress FX3).
+#
+# Without these, libsddc cannot open the device as a normal user and the driver
+# reports "no device found" even though the hardware is plugged in.
+
+# FX3 in bootloader mode. The FX3 keeps its firmware in volatile RAM and comes
+# up here on every physical reconnect, so this entry is needed just as much as
+# the ones below.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="04b4", ATTRS{idProduct}=="00f3", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# RX888 running the original SDDC firmware.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="04b4", ATTRS{idProduct}=="00f1", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# RX888 running the RaspSDR firmware, which this driver uploads.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="04b4", ATTRS{idProduct}=="3ddc", MODE="0660", GROUP="plugdev", TAG+="uaccess"
