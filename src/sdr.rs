@@ -795,8 +795,23 @@ impl Drop for Radio {
 }
 
 impl AsyncReadWorker {
+    /// Consecutive failed transfers tolerated before the stream is given up.
+    /// A single stall is often transient; the endpoint recovers once the
+    /// remaining queued transfers drain.
+    const MAX_CONSECUTIVE_ERRORS: u32 = 32;
+
     pub fn start(&self) {
-        let mut endpoint = self.interface.endpoint::<Bulk, In>(0x81).unwrap();
+        // Do not unwrap: the release profile builds with panic="abort", so a
+        // missing endpoint would abort the host process instead of reporting a
+        // streaming failure through the callback.
+        let mut endpoint = match self.interface.endpoint::<Bulk, In>(0x81) {
+            Ok(ep) => ep,
+            Err(e) => {
+                log::error!("could not claim bulk endpoint 0x81: {}", e);
+                (self.callback)(None);
+                return;
+            }
+        };
 
         // Pre-submit buffers for async transfers
         for _ in 0..32 {
@@ -805,15 +820,27 @@ impl AsyncReadWorker {
             endpoint.submit(buf);
         }
 
+        let mut errors: u32 = 0;
+
         // Main read loop
-        while let Some(transfer) = endpoint.wait_next_complete(Duration::from_millis(100)) {
+        loop {
             // Check for cancellation
             if self.cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }
 
+            // A timeout is not the end of the stream. Treating `None` as a loop
+            // exit ends streaming silently on any gap longer than the poll
+            // interval -- which is routine at low sample rates, where one 16 KiB
+            // transfer can take longer than this to fill.
+            let Some(transfer) = endpoint.wait_next_complete(Duration::from_millis(100)) else {
+                continue;
+            };
+
             match transfer.status {
                 Ok(()) => {
+                    errors = 0;
+
                     // Call user callback with received data
                     if transfer.actual_len > 0 {
                         // SAFETY: We ensure the buffer is properly aligned and sized for i16
@@ -825,7 +852,7 @@ impl AsyncReadWorker {
                             )
                         };
                         if self.rando_flag {
-                            Self::derando_simd_x8(data);
+                            Self::derando(data);
                         }
                         (self.callback)(Some(data));
                     }
@@ -834,15 +861,20 @@ impl AsyncReadWorker {
                     endpoint.submit(transfer.buffer);
                 }
                 Err(e) => {
-                    // Log error - some errors like stalls may be transient
-                    log::warn!("USB transfer error: {}", e);
+                    // Some errors, such as stalls, are transient: keep the
+                    // buffer in flight and only give up once they persist.
+                    errors += 1;
+                    log::warn!("USB transfer error ({}/{}): {}",
+                        errors, Self::MAX_CONSECUTIVE_ERRORS, e);
 
-                    // use None to signal error to callback, allowing it to clean up if needed
-                    (self.callback)(None);
+                    if errors >= Self::MAX_CONSECUTIVE_ERRORS {
+                        log::error!("too many consecutive USB transfer errors, stopping");
+                        // signal the error to the callback so it can clean up
+                        (self.callback)(None);
+                        break;
+                    }
 
-                    // Don't re-submit on error as it may cause continuous errors
-                    // The buffer is dropped and endpoint may need reset
-                    break;
+                    endpoint.submit(transfer.buffer);
                 }
             }
         }
@@ -853,7 +885,7 @@ impl AsyncReadWorker {
     //      d = d xor (-2)
     // else
     //      d = d; (unchanged)
-    fn derando_simd_x8(data: &mut [i16]) {
+    fn derando(data: &mut [i16]) {
         const LANES: usize = i16x8::LANES as usize;
         let xor_vec = i16x8::splat(-2);
 
@@ -881,6 +913,17 @@ impl AsyncReadWorker {
 
             i += LANES;
         }
+
+        // Scalar tail. Without this the last len % 8 samples are passed through
+        // still randomized: a full 16 KiB transfer happens to be a multiple of
+        // 8 samples, but a short transfer is not, and neither is any caller
+        // that hands us an arbitrary slice.
+        while i < len {
+            if data[i] & 1 == 1 {
+                data[i] ^= -2;
+            }
+            i += 1;
+        }
     }
 }
 
@@ -892,24 +935,49 @@ mod tests {
 
     use super::*;
 
+    /// Reference implementation, one sample at a time.
+    fn derando_scalar(data: &[i16]) -> Vec<i16> {
+        data.iter()
+            .map(|&d| if d & 1 == 1 { d ^ -2i16 } else { d })
+            .collect()
+    }
+
     #[test]
     fn test_rando() {
         let mut data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, -1, -2, -3, 9, -1, -2, -3];
-        let mut expected = [0i16; 16];
+        let expected = derando_scalar(&data);
 
-        for i in 0..data.len() {
-            if data[i] & 1 == 1 {
-                expected[i] = data[i] ^ (-2i16);
-            } else {
-                expected[i] = data[i];
-            }
+        AsyncReadWorker::derando(&mut data);
+
+        assert_eq!(expected, data);
+    }
+
+    /// The vectorized path handles 8 samples at a time. Exercise every possible
+    /// remainder: a length that is a multiple of 8 leaves no tail, so the
+    /// original 16-element test could not catch samples being skipped there.
+    #[test]
+    fn test_rando_unaligned_lengths() {
+        for len in 0..40usize {
+            let mut data: Vec<i16> = (0..len).map(|i| (i as i16) * 7 - 13).collect();
+            let expected = derando_scalar(&data);
+
+            AsyncReadWorker::derando(&mut data);
+
+            assert_eq!(expected, data, "mismatch at length {}", len);
         }
+    }
 
-        AsyncReadWorker::derando_simd_x8(&mut data);
+    /// De-randomizing twice must return the original: the transform is an
+    /// involution, which is what makes it safe to apply in place.
+    #[test]
+    fn test_rando_is_involution() {
+        let original: Vec<i16> = (-300..300).step_by(7).collect();
+        let mut data = original.clone();
 
-        for i in 0..data.len() {
-            assert_eq!(expected[i], data[i]);
-        }
+        AsyncReadWorker::derando(&mut data);
+        AsyncReadWorker::derando(&mut data);
+
+        assert_eq!(original, data);
     }
 
     #[test]

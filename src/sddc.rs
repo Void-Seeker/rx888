@@ -718,22 +718,28 @@ pub extern "C" fn sddc_read_async(
     let ctx_val = ctx as usize;
     unsafe {
         let device = sddc_dev_t::as_device_mut(dev);
-        device
+        // Report the error instead of unwrapping it. The release profile builds
+        // with panic="abort", so unwrapping here turns the most likely failure
+        // of all -- starting a stream that is already running -- into an abort
+        // of the host process rather than a SDDC_ERROR_BUSY return.
+        match device
             .as_mut()
             .read_async(Box::new(move |data: Option<&[i16]>| {
-                let cb = cb.unwrap();
+                // do not unwrap: a null callback must not abort the process
+                let Some(cb) = cb else {
+                    return;
+                };
                 let ctx_ptr = ctx_val as *mut c_void;
-                // SAFETY: reinterpret i16 slice as u8 for C callback
                 let (ptr, count) = match data {
                     Some(slice) => (slice.as_ptr(), slice.len() as u32),
-                    None => (std::ptr::null(), 0),
+                    None => (core::ptr::null(), 0),
                 };
                 cb(ptr, count, ctx_ptr);
-            }))
-            .unwrap();
+            })) {
+            Ok(()) => SDDC_SUCCESS,
+            Err(e) => sdr_error_to_c_int(e),
+        }
     }
-
-    0
 }
 
 /// Stop asynchronous streaming started by `sddc_read_async()`.
