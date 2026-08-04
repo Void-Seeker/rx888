@@ -130,5 +130,11 @@ for p in "libsddc$SOVER" libsddc-dev; do
         "$OUT/${p}_${FULLVER}_${ARCH}.deb" >/dev/null
 done
 
+# The staging tree has served its purpose; everything in it is inside the .debs
+# now. A failed run exits before this under set -e and leaves it behind, which
+# is what you want when working out why dpkg-deb was unhappy. KEEP_STAGE=1
+# keeps it on a successful run too.
+[ -n "${KEEP_STAGE:-}" ] || rm -rf "$STAGE"
+
 say "done"
 ls -1 "$OUT"/*.deb
