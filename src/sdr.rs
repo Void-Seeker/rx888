@@ -289,7 +289,38 @@ impl Radio {
         }
 
         if flashed_devices > 0 {
-            thread::sleep(Duration::from_millis(500));
+            // The FX3 resets and re-enumerates under the firmware PID after an
+            // upload. A single flat sleep is a coin flip: too short and the
+            // device is not back yet, so this returns None and the caller
+            // reports "no device found"; long enough to always be safe and
+            // every call pays for it. Poll instead, then let the device settle
+            // -- it enumerates a little before it will actually stream, and
+            // reads issued in that window come back empty.
+            const REENUMERATE_TIMEOUT: Duration = Duration::from_secs(10);
+            const POLL_INTERVAL: Duration = Duration::from_millis(100);
+            const SETTLE: Duration = Duration::from_millis(500);
+
+            let deadline = std::time::Instant::now() + REENUMERATE_TIMEOUT;
+            loop {
+                let back = list_devices().wait().ok().is_some_and(|devs| {
+                    devs.into_iter().any(|d| {
+                        d.vendor_id() == interface::FIRMWARE_VID
+                            && d.product_id() == interface::FIRMWARE_PID
+                    })
+                });
+                if back {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    log::warn!(
+                        "device did not re-enumerate within {:?} after firmware upload",
+                        REENUMERATE_TIMEOUT
+                    );
+                    break;
+                }
+                thread::sleep(POLL_INTERVAL);
+            }
+            thread::sleep(SETTLE);
         }
         let devices = list_devices().wait().ok()?;
         devices
@@ -336,6 +367,16 @@ impl Radio {
     /// Query direct sampling mode.
     pub fn get_direct_sampling(&self) -> bool {
         self.direct_sampling
+    }
+
+    /// Query the tuner PLL lock status (REG_TUNER bit 1, read-only).
+    ///
+    /// Only meaningful in tuner mode: in direct sampling there is no PLL to
+    /// lock and this reports false.
+    pub fn get_pll_lock(&self) -> Result<bool, SdrError> {
+        const REG_TUNER_PLL_LOCK: u32 = 1 << 1;
+        let value = Self::read_register(&self.interface, Register::REG_TUNER)?;
+        Ok(value & REG_TUNER_PLL_LOCK != 0)
     }
 
     /// Get detected radio model.

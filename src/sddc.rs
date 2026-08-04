@@ -683,6 +683,33 @@ pub extern "C" fn sddc_get_direct_sampling(dev: *mut sddc_dev_t) -> c_int {
     }
 }
 
+/// Query the tuner PLL lock status.
+///
+/// Only meaningful in tuner mode: in direct-sampling mode there is no PLL to
+/// lock and this reports 0.
+///
+/// - `dev`: device handle
+/// - `locked`: output pointer, receives 1 when locked and 0 when unlocked
+///
+/// Returns: 0 (`SDDC_SUCCESS`) on success, -1 (`SDDC_ERROR`) if `dev` or
+/// `locked` is NULL, -4 (`SDDC_ERROR_IO`) if the register read fails.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[unsafe(no_mangle)]
+pub extern "C" fn sddc_get_pll_lock(dev: *mut sddc_dev_t, locked: *mut c_int) -> c_int {
+    if locked.is_null() {
+        return SDDC_ERROR;
+    }
+    with_device_ref!(dev, |device: &Radio| {
+        match device.get_pll_lock() {
+            Ok(v) => {
+                *locked = if v { 1 } else { 0 };
+                SDDC_SUCCESS
+            }
+            Err(e) => sdr_error_to_c_int(e),
+        }
+    })
+}
+
 /// Start asynchronous sample streaming.
 ///
 /// Configures and starts the ADC, then blocks in the calling thread,
