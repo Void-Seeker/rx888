@@ -43,9 +43,23 @@ impl UsbInterface for nusb::Interface {
             index,
             data,
         };
-        self.control_out(out, timeout)
-            .wait()
-            .context("USB write failed")
+        // Retried for the same reason as Radio::write_register: the FX3 stalls
+        // the control endpoint when a register it forwards over I2C does not
+        // answer, and the stall clears on the next SETUP packet. The gain and
+        // tuner helpers reach the device through here rather than through
+        // Radio::write_register, so without this they kept failing after the
+        // writes there had been made reliable.
+        let mut last = None;
+        for attempt in 0..4 {
+            if attempt != 0 {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            match self.control_out(out.clone(), timeout).wait() {
+                Ok(_) => return Ok(()),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap()).context("USB write failed after 4 attempts")
     }
 
     fn control_read(
@@ -64,8 +78,16 @@ impl UsbInterface for nusb::Interface {
             index,
             length,
         };
-        self.control_in(inp, timeout)
-            .wait()
-            .context("USB read failed")
+        let mut last = None;
+        for attempt in 0..4 {
+            if attempt != 0 {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            match self.control_in(inp.clone(), timeout).wait() {
+                Ok(v) => return Ok(v),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap()).context("USB read failed after 4 attempts")
     }
 }

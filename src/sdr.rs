@@ -132,23 +132,43 @@ pub struct Radio {
     read_thread: Option<JoinHandle<()>>,
 }
 
+/// How many times a vendor control transfer is attempted before giving up. The
+/// FX3 stalls the control endpoint when a register it forwards over I2C does
+/// not answer, and that clears on the next SETUP packet, so retrying is both
+/// safe and usually enough.
+const CONTROL_ATTEMPTS: u32 = 4;
+
 impl Radio {
     fn read_register(interface: &Interface, reg: Register) -> Result<u32, SdrError> {
-        let data = interface
-            .control_in(
-                ControlIn {
-                    control_type: ControlType::Vendor,
-                    recipient: Recipient::Device,
-                    request: FX3Command::REGOP as u8,
-                    value: 0,
-                    index: reg as u16,
-                    length: 4,
-                },
-                Duration::from_millis(500),
-            )
-            .wait()
-            .map_err(|e| SdrError::CommunicationError(e.to_string()))?;
-        Ok(u32::from_le_bytes([data[0], data[1], data[2], data[3]]))
+        // Stalls the same way a write does, and for the same reason; see the
+        // comment in write_register.
+        let mut last = None;
+        for attempt in 0..CONTROL_ATTEMPTS {
+            if attempt != 0 {
+                thread::sleep(Duration::from_millis(2));
+            }
+            match interface
+                .control_in(
+                    ControlIn {
+                        control_type: ControlType::Vendor,
+                        recipient: Recipient::Device,
+                        request: FX3Command::REGOP as u8,
+                        value: 0,
+                        index: reg as u16,
+                        length: 4,
+                    },
+                    Duration::from_millis(500),
+                )
+                .wait()
+            {
+                Ok(data) => return Ok(u32::from_le_bytes([data[0], data[1], data[2], data[3]])),
+                Err(e) => last = Some(format!("{reg:?}: {e}")),
+            }
+        }
+        Err(SdrError::CommunicationError(format!(
+            "{} (after {CONTROL_ATTEMPTS} attempts)",
+            last.unwrap_or_else(|| format!("{reg:?}: unknown failure"))
+        )))
     }
 
     fn write_register(interface: &Interface, reg: Register, value: u32) -> Result<(), SdrError> {
@@ -162,9 +182,8 @@ impl Radio {
         // stall on the control endpoint is cleared by the next SETUP packet, so
         // asking again is all it takes, and the retry costs nothing when the
         // write succeeds first time as it usually does.
-        const ATTEMPTS: u32 = 4;
         let mut last = None;
-        for attempt in 0..ATTEMPTS {
+        for attempt in 0..CONTROL_ATTEMPTS {
             if attempt != 0 {
                 thread::sleep(Duration::from_millis(2));
             }
@@ -195,7 +214,7 @@ impl Radio {
             }
         }
         Err(SdrError::CommunicationError(format!(
-            "{} (after {ATTEMPTS} attempts)",
+            "{} (after {CONTROL_ATTEMPTS} attempts)",
             last.unwrap_or_else(|| format!("{reg:?}: unknown failure"))
         )))
     }
