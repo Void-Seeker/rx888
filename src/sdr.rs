@@ -167,7 +167,11 @@ impl Radio {
                 Duration::from_millis(500),
             )
             .wait()
-            .map_err(|e| SdrError::CommunicationError(e.to_string()))?;
+            // Name the register in the error. Every one of these failures used
+            // to arrive as a bare "endpoint stalled", which says nothing about
+            // which of the seven writes in a stream start was the one that
+            // stalled.
+            .map_err(|e| SdrError::CommunicationError(format!("{reg:?}: {e}")))?;
         Ok(())
     }
 
@@ -523,6 +527,37 @@ impl Radio {
     /// `callback(&[u8])` with raw ADC bytes. If `blocking` is true, the call
     /// will join the thread (and thus not return) until `read_cancel()` is
     /// invoked from another thread. Validates SuperSpeed mode prior to start.
+    /// The register writes that arm the hardware for streaming.
+    ///
+    /// Split out from read_async so a failure part-way through is one error for
+    /// the caller to undo, rather than seven early returns each leaving the
+    /// device in a different half-configured state.
+    fn arm_for_streaming(&mut self) -> Result<(), SdrError> {
+        Self::write_register(
+            &self.interface,
+            Register::REG_TUNER,
+            if self.direct_sampling { 0 } else { 1 },
+        )?;
+
+        Self::write_register(&self.interface, Register::REG_ADCFREQ, self.xtal_freq)?;
+        Self::write_register(
+            &self.interface,
+            Register::REG_DIRECT_ADC_FILTER,
+            self.adc_filter as u32,
+        )?;
+        // these are applied immediately because the state is already running
+        self.set_center_freq(self.center_freq)?;
+        self.set_if_gain(self.if_gain)?;
+        self.set_rf_gain(self.rf_gain)?;
+
+        Self::write_register(
+            &self.interface,
+            Register::REG_ADC,
+            (self.adc_flags | REG_ADC_ENABLE) as u32,
+        )?;
+        Ok(())
+    }
+
     pub fn read_async<F>(&mut self, callback: F) -> Result<(), SdrError>
     where
         F: Fn(Option<&[i16]>) + Send + Sync + 'static,
@@ -536,30 +571,19 @@ impl Radio {
             return Err(SdrError::NotSuperSpeed);
         }
 
+        // The settings below only reach the hardware when the device is already
+        // marked running, so the state has to be set before them rather than
+        // after. That makes everything from here on responsible for putting it
+        // back on the way out: any of these writes can fail -- they are 500 ms
+        // control transfers with no retry -- and returning straight out left the
+        // device marked running with no reader thread behind it. A caller that
+        // trusted the state then saw a stream that was not there, and the next
+        // start had to work it out for itself.
         self.state = DeviceState::Running;
-
-        Self::write_register(
-            &self.interface,
-            Register::REG_TUNER,
-            if self.direct_sampling { 0 } else { 1 },
-        )?;
-
-        Self::write_register(&self.interface, Register::REG_ADCFREQ, self.xtal_freq)?;
-        Self::write_register(
-            &self.interface,
-            Register::REG_DIRECT_ADC_FILTER,
-            self.adc_filter as u32,
-        )?;
-        // since state is set to running, other settings will be applied immediately
-        self.set_center_freq(self.center_freq)?;
-        self.set_if_gain(self.if_gain)?;
-        self.set_rf_gain(self.rf_gain)?;
-
-        Self::write_register(
-            &self.interface,
-            Register::REG_ADC,
-            (self.adc_flags | REG_ADC_ENABLE) as u32,
-        )?;
+        if let Err(e) = self.arm_for_streaming() {
+            self.state = DeviceState::Idle;
+            return Err(e);
+        }
 
         // Create shared cancel flag
         let cancel_flag = Arc::new(AtomicBool::new(false));
