@@ -154,25 +154,50 @@ impl Radio {
     fn write_register(interface: &Interface, reg: Register, value: u32) -> Result<(), SdrError> {
         log::debug!("Writing register {:?} with value {}", reg, value);
         let data = value.to_le_bytes();
-        interface
-            .control_out(
-                ControlOut {
-                    control_type: ControlType::Vendor,
-                    recipient: Recipient::Device,
-                    request: FX3Command::REGOP as u8,
-                    value: 0,
-                    index: reg as u16,
-                    data: &data,
-                },
-                Duration::from_millis(500),
-            )
-            .wait()
-            // Name the register in the error. Every one of these failures used
-            // to arrive as a bare "endpoint stalled", which says nothing about
-            // which of the seven writes in a stream start was the one that
-            // stalled.
-            .map_err(|e| SdrError::CommunicationError(format!("{reg:?}: {e}")))?;
-        Ok(())
+
+        // The FX3 forwards some of these to the tuner over I2C and stalls the
+        // control endpoint when that transaction does not go through, which is
+        // what made roughly one stream start in six fail on
+        // REG_TUNER_CENTER_FREQ_LOW. Nothing is wrong with the USB state: a
+        // stall on the control endpoint is cleared by the next SETUP packet, so
+        // asking again is all it takes, and the retry costs nothing when the
+        // write succeeds first time as it usually does.
+        const ATTEMPTS: u32 = 4;
+        let mut last = None;
+        for attempt in 0..ATTEMPTS {
+            if attempt != 0 {
+                thread::sleep(Duration::from_millis(2));
+            }
+            match interface
+                .control_out(
+                    ControlOut {
+                        control_type: ControlType::Vendor,
+                        recipient: Recipient::Device,
+                        request: FX3Command::REGOP as u8,
+                        value: 0,
+                        index: reg as u16,
+                        data: &data,
+                    },
+                    Duration::from_millis(500),
+                )
+                .wait()
+            {
+                Ok(_) => {
+                    if attempt != 0 {
+                        log::debug!("register {reg:?} accepted on attempt {}", attempt + 1);
+                    }
+                    return Ok(());
+                }
+                // Name the register in the error. These used to arrive as a bare
+                // "endpoint stalled", which says nothing about which of the seven
+                // writes in a stream start was the one that failed.
+                Err(e) => last = Some(format!("{reg:?}: {e}")),
+            }
+        }
+        Err(SdrError::CommunicationError(format!(
+            "{} (after {ATTEMPTS} attempts)",
+            last.unwrap_or_else(|| format!("{reg:?}: unknown failure"))
+        )))
     }
 
     pub fn open(index: u32) -> Result<Self, SdrError> {
